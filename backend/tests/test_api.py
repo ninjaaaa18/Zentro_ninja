@@ -1,0 +1,293 @@
+﻿import httpx
+from fastapi.testclient import TestClient
+
+from app.services.paypal import (
+    PayPalAuthenticationFailed,
+    PayPalClient,
+    PaymentProviderNotConfigured,
+)
+from main import create_app
+
+
+class RejectingPolicyVerifier:
+    def verify_authorization(
+        self,
+        *,
+        order_id: str,
+        authorization_id: str,
+    ) -> bool:
+        return False
+
+
+class ApprovingPolicyVerifier:
+    def verify_authorization(
+        self,
+        *,
+        order_id: str,
+        authorization_id: str,
+    ) -> bool:
+        return authorization_id == "policy-engine-approval"
+
+
+class RecordingPayPalClient:
+    def __init__(self) -> None:
+        self.captured_order_ids: list[str] = []
+
+    def capture_order(self, order_id: str) -> None:
+        self.captured_order_ids.append(order_id)
+        raise PaymentProviderNotConfigured("Capture is not implemented.")
+
+    def create_order(self, *, amount: str, currency: str) -> dict:
+        return {
+            "order_id": "test-order-id",
+            "approval_url": (
+                "https://www.sandbox.paypal.com/"
+                "webapps/merchant-auth?token=testToken"
+            ),
+        }
+
+
+def test_health_and_order_lifecycle_placeholders() -> None:
+    paypal = RecordingPayPalClient()
+    client = TestClient(create_app(paypal_client=paypal))
+
+    assert client.get("/health").json() == {"status": "ok"}
+
+    created = client.post(
+        "/payments/create-order",
+        json={"amount": "12.50", "currency": "USD"},
+    )
+
+    assert created.status_code == 201
+
+    order = created.json()
+    assert order["status"] == "pending_authorization"
+    assert order["amount"] == "12.50"
+    assert order["paypal_order_id"] == "test-order-id"
+    assert order["approval_url"] == (
+        "https://www.sandbox.paypal.com/"
+        "webapps/merchant-auth?token=testToken"
+    )
+
+    retrieved = client.get(f"/payments/{order['id']}")
+    assert retrieved.status_code == 200
+    assert retrieved.json() == order
+
+    assert client.get("/payments/missing-order").status_code == 404
+
+
+def test_invalid_order_input_is_rejected() -> None:
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/payments/create-order",
+        json={"amount": "-1", "currency": "usd"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_capture_fails_closed_when_policy_engine_is_unconfigured() -> None:
+    client = TestClient(create_app())
+
+    order = client.post(
+        "/payments/create-order",
+        json={"amount": "10.00", "currency": "USD"},
+    ).json()
+
+    response = client.post(
+        f"/payments/capture/{order['id']}",
+        json={"authorization_id": "approval-reference"},
+    )
+
+    assert response.status_code == 503
+
+
+def test_frontend_approval_flag_is_not_accepted() -> None:
+    client = TestClient(create_app())
+
+    order = client.post(
+        "/payments/create-order",
+        json={"amount": "10.00", "currency": "USD"},
+    ).json()
+
+    response = client.post(
+        f"/payments/capture/{order['id']}",
+        json={
+            "authorization_id": "approval-reference",
+            "approved": True,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_invalid_policy_authorization_never_reaches_paypal() -> None:
+    paypal = RecordingPayPalClient()
+
+    client = TestClient(
+        create_app(
+            policy_verifier=RejectingPolicyVerifier(),
+            paypal_client=paypal,
+        )
+    )
+
+    order = client.post(
+        "/payments/create-order",
+        json={"amount": "10.00", "currency": "USD"},
+    ).json()
+
+    response = client.post(
+        f"/payments/capture/{order['id']}",
+        json={"authorization_id": "unapproved-reference"},
+    )
+
+    assert response.status_code == 403
+    assert paypal.captured_order_ids == []
+
+
+def test_valid_policy_authorization_still_does_not_process_payment() -> None:
+    paypal = RecordingPayPalClient()
+
+    client = TestClient(
+        create_app(
+            policy_verifier=ApprovingPolicyVerifier(),
+            paypal_client=paypal,
+        )
+    )
+
+    order = client.post(
+        "/payments/create-order",
+        json={"amount": "10.00", "currency": "USD"},
+    ).json()
+
+    response = client.post(
+        f"/payments/capture/{order['id']}",
+        json={"authorization_id": "policy-engine-approval"},
+    )
+
+    assert response.status_code == 501
+
+    # The route must send the PayPal order ID, not the internal ID.
+    assert paypal.captured_order_ids == ["test-order-id"]
+
+    assert client.get(
+        f"/payments/{order['id']}"
+    ).json()["status"] == "pending_authorization"
+
+
+def test_paypal_connection_test_fails_with_missing_credentials(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("PAYPAL_CLIENT_ID", raising=False)
+    monkeypatch.delenv("PAYPAL_CLIENT_SECRET", raising=False)
+
+    client = TestClient(create_app())
+
+    response = client.get("/payments/paypal/connection-test")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "PayPal Sandbox credentials are not configured."
+    }
+
+
+def test_paypal_connection_test_authenticates_without_exposing_secrets(
+    monkeypatch,
+) -> None:
+    client_id = "sandbox-client-id"
+    client_secret = "sandbox-client-secret"
+    access_token = "internal-access-token"
+
+    monkeypatch.setenv("PAYPAL_CLIENT_ID", client_id)
+    monkeypatch.setenv("PAYPAL_CLIENT_SECRET", client_secret)
+    monkeypatch.setenv(
+        "PAYPAL_BASE_URL",
+        "https://api-m.sandbox.paypal.com",
+    )
+
+    request_details: dict[str, object] = {}
+
+    def mock_post(url: str, **kwargs):
+        request_details["url"] = url
+        request_details.update(kwargs)
+
+        return httpx.Response(
+            200,
+            json={"access_token": access_token},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("app.services.paypal.httpx.post", mock_post)
+
+    client = TestClient(create_app())
+    response = client.get("/payments/paypal/connection-test")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "message": "PayPal Sandbox connection successful.",
+    }
+
+    assert request_details["url"] == (
+        "https://api-m.sandbox.paypal.com/v1/oauth2/token"
+    )
+    assert request_details["data"] == {
+        "grant_type": "client_credentials"
+    }
+    assert request_details["auth"] == (client_id, client_secret)
+    assert request_details["timeout"] == PayPalClient.timeout_seconds
+
+    assert client_id not in response.text
+    assert client_secret not in response.text
+    assert access_token not in response.text
+
+
+def test_paypal_connection_test_handles_authentication_failure(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PAYPAL_CLIENT_ID", "sandbox-client-id")
+    monkeypatch.setenv("PAYPAL_CLIENT_SECRET", "sandbox-client-secret")
+
+    def mock_post(url: str, **kwargs):
+        request = httpx.Request("POST", url)
+        return httpx.Response(401, request=request)
+
+    monkeypatch.setattr("app.services.paypal.httpx.post", mock_post)
+
+    client = TestClient(create_app())
+    response = client.get("/payments/paypal/connection-test")
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "PayPal Sandbox connection test failed."
+    }
+    assert "sandbox-client-id" not in response.text
+    assert "sandbox-client-secret" not in response.text
+
+
+def test_paypal_client_does_not_include_credentials_in_auth_errors(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PAYPAL_CLIENT_ID", "private-client-id")
+    monkeypatch.setenv("PAYPAL_CLIENT_SECRET", "private-client-secret")
+
+    def mock_post(url: str, **kwargs):
+        request = httpx.Request("POST", url)
+        response = httpx.Response(401, request=request)
+
+        raise httpx.HTTPStatusError(
+            "upstream error",
+            request=request,
+            response=response,
+        )
+
+    monkeypatch.setattr("app.services.paypal.httpx.post", mock_post)
+
+    try:
+        PayPalClient().get_access_token()
+    except PayPalAuthenticationFailed as error:
+        assert "private-client-id" not in str(error)
+        assert "private-client-secret" not in str(error)
+    else:
+        raise AssertionError("Expected authentication to fail.")
